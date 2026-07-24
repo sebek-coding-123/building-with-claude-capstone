@@ -274,16 +274,21 @@ def extract_product_record(
     - After MAX_PARSE_RETRIES attempts, re-raise the last ValidationError
     """
     messages = [{"role":"user","content":f"sku: {sku} {raw_description} extract all ProductRecord fields"}]
-    client.messages.parse("claude-sonnet-4-6",1500,system=ENRICHMENT_SYSTEM, messages=messages,output_format=ProductRecord)
-    raise NotImplementedError("Phase 2 ▸ implement extract_product_record()")
-
-
+    for i in range(MAX_PARSE_RETRIES + 1):
+        try:
+            response = client.messages.parse(model = "claude-sonnet-4-6", max_tokens=1500,system=ENRICHMENT_SYSTEM, messages=messages,output_format=ProductRecord)
+            return response, i
+        except ValidationError as e:
+            if i == MAX_PARSE_RETRIES:
+                raise
+            messages.append({"role":"user","content":f"ERROR: {str(e)}"})
+            
+    
 def run_enrichment_pipeline(
     client: anthropic.Anthropic,
     raw_products: Optional[dict[str, str]] = None,
 ) -> tuple[list[ProductRecord], dict]:
     """Run extract_product_record() over every raw vendor description.
-
     TODO (Phase 2):
     - Default raw_products to load_raw_products() when not provided
     - For each (sku, raw_description):
@@ -296,9 +301,38 @@ def run_enrichment_pipeline(
     - Return (list[ProductRecord], summary_dict) where summary_dict has
       keys: "succeeded", "failed" (list of skus), "retried" (dict sku->count)
     """
-    raise NotImplementedError("Phase 2 ▸ implement run_enrichment_pipeline()")
-
-
+    if raw_products is None:
+        raw_products = load_raw_products()
+    results = []
+    succeeded = 0
+    failed = 0
+    retried = 0
+    list_failed = []
+    retry_dict = {}
+    for sku, raw_description in raw_products.items():
+        try:
+            record, retries = extract_product_record(client,sku,raw_description)
+            results.append(record)
+            succeeded += 1
+            if retries > 0:
+                retry_dict[sku]=retries
+                retried +=1
+        except ValidationError as e:
+            print(f"ERROR: {sku} - {e}")
+            failed += 1
+            list_failed.append(sku)
+    print("-----SUMMARY-----")
+    print(f"succeeded:{succeeded:>8}")
+    print(f"failed:   {failed:>8}")
+    for failed in list_failed:
+        print(failed)
+    print(f"retried:  {retried:>8}")
+    summary_dict = {
+        "succeeded":results,
+        "failed":failed,
+        "retried":retry_dict 
+    }
+    return results, summary_dict
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHASE 3 — Multi-Turn Q&A Conversation (Day 2 skills)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -405,6 +439,7 @@ def build_qa_tools() -> list[dict]:
       get_current_price are for live, daily-changing data; fetch_vendor_spec
       is for a spec missing from the retrieved catalogue context
     """
+    return []
     raise NotImplementedError("Phase 4 ▸ implement build_qa_tools()")
 
 
