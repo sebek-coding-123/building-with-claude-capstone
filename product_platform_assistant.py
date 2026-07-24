@@ -249,10 +249,11 @@ class ProductRecord(BaseModel):
     care_instructions:  Optional[str]   # Optional[str] — relevant for apparel/homeware
 
     @field_validator("price_inr")
-    def validate_price_inr(cls,value):
+    @classmethod
+    def validate_price_inr(cls, value):
         if value <= 0:
             raise ValueError("price_inr must be positive")
-    # TODO: add @field_validator("price_inr") that raises ValueError if value <= 0
+        return value  # Pydantic v2: a validator MUST return the value, or the field becomes None
 
 
 def extract_product_record(
@@ -276,8 +277,8 @@ def extract_product_record(
     messages = [{"role":"user","content":f"sku: {sku} {raw_description} extract all ProductRecord fields"}]
     for i in range(MAX_PARSE_RETRIES + 1):
         try:
-            response = client.messages.parse(model = "claude-sonnet-4-6", max_tokens=1500,system=ENRICHMENT_SYSTEM, messages=messages,output_format=ProductRecord)
-            return response, i
+            response = client.messages.parse(model=MODEL, max_tokens=1500, system=ENRICHMENT_SYSTEM, messages=messages, output_format=ProductRecord)
+            return response.parsed_output, i  # return the validated ProductRecord, not the raw response
         except ValidationError as e:
             if i == MAX_PARSE_RETRIES:
                 raise
@@ -321,16 +322,17 @@ def run_enrichment_pipeline(
             print(f"ERROR: {sku} - {e}")
             failed += 1
             list_failed.append(sku)
-    print("-----SUMMARY-----")
-    print(f"succeeded:{succeeded:>8}")
-    print(f"failed:   {failed:>8}")
-    for failed in list_failed:
-        print(failed)
-    print(f"retried:  {retried:>8}")
+    print("----- SUMMARY -----")
+    print(f"processed: {len(raw_products):>8}")
+    print(f"succeeded: {succeeded:>8}")
+    print(f"failed:    {failed:>8}")
+    for bad_sku in list_failed:
+        print(f"  - {bad_sku}")
+    print(f"retried:   {retried:>8}")
     summary_dict = {
-        "succeeded":results,
-        "failed":failed,
-        "retried":retry_dict 
+        "succeeded": succeeded,
+        "failed": list_failed,
+        "retried": retry_dict,
     }
     return results, summary_dict
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -364,17 +366,28 @@ class ProductConversationManager:
     """
 
     def __init__(self, client: anthropic.Anthropic, system: str) -> None:
-        raise NotImplementedError("Phase 3 ▸ implement ProductConversationManager.__init__()")
-
+        self.client = client
+        self.system = system
+        self.messages = []
+        self.products_discussed: set[str] = set()
     def send(self, user_message: str, skus_mentioned: tuple[str, ...] = ()) -> str:
-        raise NotImplementedError("Phase 3 ▸ implement ProductConversationManager.send()")
-
+        for sku in skus_mentioned:
+            self.products_discussed.add(sku)
+        self.messages.append({"role":"user", "content":user_message})
+        reply = self.client.messages.create(model="claude-sonnet-4-6", max_tokens=1500, system=self.system,messages=self.messages)
+        self.messages.append({"role":"assistant","content":reply.content})
+        return reply.content[0].text
+    
     def token_count(self) -> int:
-        raise NotImplementedError("Phase 3 ▸ implement ProductConversationManager.token_count()")
-
+        result = self.client.messages.count_tokens(model="claude-sonnet-4-6", system=self.system, messages=self.messages)
+        if result.input_tokens > TOKEN_WARN_THRESHOLD:
+            print("WARNING: Token threshold exceeded")
+        return result.input_tokens
+     
     def summarise_and_reset(self) -> str:
-        raise NotImplementedError("Phase 3 ▸ implement ProductConversationManager.summarise_and_reset()")
-
+        self.messages.append({"role":"user", "content":"Summarize this conversation in <=150 words, preserving which SKUs were discussed and any open questions"})
+        response = self.client.messages.create(model="claude-sonnet-4-6",max_tokens=1500, system=self.system,messages=self.messages)
+        self.messages = [{"role":"user","content":f"[Summary]\\n {response.content[0].text}"}]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHASE 4 — Real-Time Tool Integration (Day 3 skills)
@@ -439,8 +452,67 @@ def build_qa_tools() -> list[dict]:
       get_current_price are for live, daily-changing data; fetch_vendor_spec
       is for a spec missing from the retrieved catalogue context
     """
-    return []
-    raise NotImplementedError("Phase 4 ▸ implement build_qa_tools()")
+    return [
+        {
+            "name": "check_inventory",
+            "description": (
+                "Look up LIVE stock availability for a product by its SKU. Call this "
+                "whenever the customer asks whether an item is in stock, how many units "
+                "are available, or which warehouse it ships from. Inventory changes "
+                "daily, so always call this tool rather than trusting the catalogue."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sku": {"type": "string", "description": "The product SKU, e.g. 'SKU-E001'."},
+                },
+                "required": ["sku"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "get_current_price",
+            "description": (
+                "Look up the LIVE selling price and any active discount for a product by "
+                "its SKU. Call this whenever the customer asks about price, cost, "
+                "discounts, or current offers. Pricing and promotions change daily, so "
+                "always call this tool rather than quoting a price from the catalogue."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sku": {"type": "string", "description": "The product SKU, e.g. 'SKU-E001'."},
+                },
+                "required": ["sku"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "fetch_vendor_spec",
+            "description": (
+                "Fetch a single named specification field from the vendor's spec sheet "
+                "for a product. Call this ONLY when a specific spec the customer asked "
+                "about is missing from the retrieved product context — for example "
+                "'ram', 'ports', 'thunderbolt', 'water_resistance', 'warranty', or "
+                "'isi_certification'. Do not use it for live stock or pricing."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "sku": {"type": "string", "description": "The product SKU, e.g. 'SKU-E001'."},
+                    "spec_field": {
+                        "type": "string",
+                        "description": (
+                            "The spec field to look up, e.g. 'ram', 'ports', "
+                            "'water_resistance', 'warranty'."
+                        ),
+                    },
+                },
+                "required": ["sku", "spec_field"],
+                "additionalProperties": False,
+            },
+        },
+    ]
 
 
 def run_qa_agentic_loop(
@@ -471,12 +543,87 @@ def run_qa_agentic_loop(
     - Append response.content (the list), NOT response.content[0].text
     - Tool result content must be json.dumps(result) — a string, not a dict
     """
-    raise NotImplementedError("Phase 4 ▸ implement run_qa_agentic_loop()")
+    messages = list(conversation_history)  # copy so we don't mutate the caller's list
+    # QA_SYSTEM still carries the {product_context} slot; in the agentic-loop path the
+    # retrieved context is supplied via the conversation messages, so blank the slot.
+    system = QA_SYSTEM.format(product_context="") if "{product_context}" in QA_SYSTEM else QA_SYSTEM
+
+    while True:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1500,
+            system=system,
+            tools=tools,
+            messages=messages,
+        )
+        # Append the full content list (text + any tool_use blocks), never just .text
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason == "end_turn":
+            break
+
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            print(f"  [tool] {block.name}({json.dumps(block.input)})")
+            result = TOOL_FN_MAP[block.name](**block.input)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": json.dumps(result),          # must be a string, not a dict
+                "is_error": "error" in result,
+            })
+
+        if not tool_results:
+            # Non-end_turn stop with no tool calls (e.g. max_tokens/refusal) — stop looping
+            break
+
+        messages.append({"role": "user", "content": tool_results})
+
+    return messages
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHASE 5 — RAG over Product Catalogue and Vendor Specs (Day 3-4 skills)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _embed_texts(texts: list[str], input_type: str) -> list[list[float]]:
+    """Embed texts with OpenAI (text-embedding-3-small), read from OPENAI_API_KEY.
+
+    `input_type` ('document' for indexing, 'query' for retrieval) is kept for
+    call-site symmetry with providers that distinguish the two roles; OpenAI's
+    embeddings do not, so it is accepted and ignored here."""
+    import openai  # lazy so Phases 1-4 run without OPENAI_API_KEY / the package
+
+    client = openai.OpenAI()  # reads OPENAI_API_KEY from the environment
+    response = client.embeddings.create(input=texts, model="text-embedding-3-small")
+    return [item.embedding for item in response.data]
+
+
+def _product_to_document(rec: ProductRecord) -> str:
+    """Flatten a ProductRecord into a single embeddable text document."""
+    lines = [
+        f"{rec.name} ({rec.brand or 'unbranded'})",
+        f"Category: {rec.category} / {rec.subcategory}",
+        f"Price: INR {rec.price_inr:.0f}",
+    ]
+    if rec.key_features:
+        lines.append("Key features: " + "; ".join(rec.key_features))
+    if rec.specifications:
+        lines.append("Specifications: " + "; ".join(f"{k}: {v}" for k, v in rec.specifications.items()))
+    if rec.warranty_months:
+        lines.append(f"Warranty: {rec.warranty_months} months")
+    if rec.care_instructions:
+        lines.append(f"Care: {rec.care_instructions}")
+    return "\n".join(lines)
+
+
+def _sku_from_spec(text: str) -> Optional[str]:
+    """Pull the SKU out of a vendor spec-sheet header, e.g. '... (SKU-E001)'."""
+    match = re.search(r"\((SKU-[A-Z0-9-]+)\)", text)
+    return match.group(1) if match else None
+
 
 def build_product_index(records: list[ProductRecord]) -> object:
     """Build a Chroma collection over enriched products + vendor spec sheets.
@@ -498,7 +645,48 @@ def build_product_index(records: list[ProductRecord]) -> object:
       (map filename -> sku, e.g. via a small dict or filename convention)
     - Return the populated collection
     """
-    raise NotImplementedError("Phase 5 ▸ implement build_product_index()")
+    import chromadb  # lazy import — Phases 1-4 run without chromadb installed
+
+    collection = chromadb.EphemeralClient().get_or_create_collection(CHROMA_COLLECTION_NAME)
+
+    ids: list[str] = []
+    documents: list[str] = []
+    metadatas: list[dict] = []
+
+    # One document per enriched catalogue record.
+    category_by_sku = {rec.sku: rec.category for rec in records}
+    for rec in records:
+        ids.append(rec.sku)
+        documents.append(_product_to_document(rec))
+        metadatas.append({
+            "sku": rec.sku,
+            "category": rec.category,
+            "brand": rec.brand or "unknown",   # Chroma metadata can't be None
+            "source": "catalogue",
+        })
+
+    # One document per vendor spec sheet; SKU parsed from the header, category
+    # borrowed from the matching record so category filtering covers specs too.
+    for spec_path in sorted(VENDOR_SPEC_DIR.glob("*.md")):
+        spec_text = spec_path.read_text(encoding="utf-8")
+        sku = _sku_from_spec(spec_text)
+        ids.append(f"{sku}-vendor-spec" if sku else spec_path.stem)
+        documents.append(spec_text)
+        metadatas.append({
+            "sku": sku or "unknown",
+            "category": category_by_sku.get(sku, "unknown"),
+            "source": "vendor_spec",
+        })
+
+    collection.add(
+        ids=ids,
+        documents=documents,
+        embeddings=_embed_texts(documents, input_type="document"),
+        metadatas=metadatas,
+    )
+    print(f"  Indexed {len(records)} products + {len(ids) - len(records)} "
+          f"vendor spec sheets into '{CHROMA_COLLECTION_NAME}'.")
+    return collection
 
 
 def retrieve_product_context(
@@ -523,7 +711,24 @@ def retrieve_product_context(
     `"citations": {"enabled": true}` should be wired in on the message block
     that carries this context, so answers cite verifiable sources.
     """
-    raise NotImplementedError("Phase 5 ▸ implement retrieve_product_context()")
+    query_embedding = _embed_texts([query], input_type="query")[0]
+    results = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        # Apply the category filter only when the customer has specified one.
+        where={"category": category_filter} if category_filter else None,
+    )
+
+    documents = (results.get("documents") or [[]])[0]
+    metadatas = (results.get("metadatas") or [[]])[0]
+    if not documents:
+        return ""
+
+    blocks = []
+    for doc, meta in zip(documents, metadatas):
+        sku = (meta or {}).get("sku", "unknown")
+        blocks.append(f"[Product Context: {sku}]\n{doc}")
+    return "\n\n".join(blocks)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -531,14 +736,26 @@ def retrieve_product_context(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 FAITHFULNESS_JUDGE_SYSTEM = """
-TODO (Phase 6): Write the faithfulness judge system prompt.
+You are a strict evaluation judge for ShopMart's product Q&A assistant. You are given
+the PRODUCT CONTEXT that was available to the assistant and the ASSISTANT ANSWER it
+produced. Judge only whether the answer is grounded in the provided context.
 
-It should instruct Claude to:
-- Score 1-5 how well an answer is supported by the provided product context
-  (1 = hallucinated, 5 = fully grounded)
-- Flag (in the reasoning) any warranty period, compatibility claim, or
-  certification status stated in the answer but absent from the context
-- Return JSON: {"score": <int>, "reasoning": "<str>"}
+Scoring (integer 1-5):
+- 5 = every factual claim in the answer is directly supported by the product context.
+- 4 = fully supported, with minor harmless phrasing not drawn from the context.
+- 3 = mostly supported but includes at least one claim that cannot be verified from the context.
+- 2 = several claims are unsupported by the context.
+- 1 = the answer is largely fabricated / contradicts or ignores the context.
+
+Rules:
+- An answer that correctly declines because the requested detail is not in the context
+  (e.g. the defined fallback response) is FULLY faithful — score it 5.
+- In your reasoning, explicitly flag any warranty period, compatibility claim, or
+  certification status that the answer states but that is absent from the context.
+- Do not reward or penalise tone, helpfulness, or completeness — only factual grounding.
+
+Return ONLY a single JSON object and nothing else:
+{"score": <int 1-5>, "reasoning": "<one or two sentences>"}
 """
 
 
@@ -553,7 +770,62 @@ def judge_faithfulness(client: anthropic.Anthropic, context: str, answer: str) -
     - Return the parsed dict {"score": int, "reasoning": str}
     - On any parse error, return {"score": 0, "reasoning": "parse error: <raw text>"}
     """
-    raise NotImplementedError("Phase 6 ▸ implement judge_faithfulness()")
+    user_prompt = (
+        "PRODUCT CONTEXT:\n"
+        f"{context or '(no product context was retrieved)'}\n\n"
+        "ASSISTANT ANSWER:\n"
+        f"{answer}\n\n"
+        "Score how well the assistant answer is supported by the product context above."
+    )
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=500,
+        system=FAITHFULNESS_JUDGE_SYSTEM,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    text = "".join(b.text for b in response.content if b.type == "text")
+    try:
+        match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
+        payload = match.group(1) if match else text
+        data = json.loads(payload)
+        return {"score": int(data["score"]), "reasoning": str(data.get("reasoning", ""))}
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+        return {"score": 0, "reasoning": f"parse error: {text}"}
+
+
+_SPEC_STOPWORDS = {
+    "and", "the", "with", "for", "not", "only", "inch", "inches", "size",
+    "colour", "color", "built", "into", "your", "per", "via", "plus",
+}
+
+
+def _values_match(field: str, actual: Any, expected: Any) -> bool:
+    """Field-aware comparison of an extracted value against ground truth."""
+    if actual is None:
+        return False
+    if field == "price_inr":
+        try:
+            return abs(float(actual) - float(expected)) < 1.0
+        except (TypeError, ValueError):
+            return False
+    if field == "brand":
+        a, e = str(actual).strip().lower(), str(expected).strip().lower()
+        return a == e or e in a or a in e   # "Himalaya" vs "Himalaya Herbals"
+    if isinstance(expected, bool):
+        return actual == expected
+    if isinstance(expected, str):
+        return str(actual).strip().lower() == expected.strip().lower()
+    return actual == expected
+
+
+def _is_hallucinated(value: str, raw_lower: str) -> bool:
+    """Conservative hallucination flag: a spec/feature counts as hallucinated only
+    if NONE of its meaningful tokens appear anywhere in the raw vendor description."""
+    tokens = re.findall(r"[a-z0-9]+", str(value).lower())
+    meaningful = [t for t in tokens if len(t) >= 3 and t not in _SPEC_STOPWORDS]
+    if not meaningful:
+        return False
+    return not any(t in raw_lower for t in meaningful)
 
 
 def evaluate_enrichment_accuracy(
@@ -572,7 +844,36 @@ def evaluate_enrichment_accuracy(
     - Return {"field_accuracy": float, "hallucinated_specs": int,
       "flagged_skus": list[str]}
     """
-    raise NotImplementedError("Phase 6 ▸ implement evaluate_enrichment_accuracy()")
+    by_sku = {rec.sku: rec for rec in records}
+    raw_products = load_raw_products()
+
+    correct = total = hallucinated = 0
+    flagged: set[str] = set()
+
+    for entry in golden_set:
+        sku = entry["sku"]
+        ground_truth = entry["ground_truth"]
+        rec = by_sku.get(sku)
+        if rec is None:
+            total += len(ground_truth)   # missing record → every field counts as wrong
+            continue
+
+        for field, expected in ground_truth.items():
+            total += 1
+            if _values_match(field, getattr(rec, field, None), expected):
+                correct += 1
+
+        raw_lower = raw_products.get(sku, "").lower()
+        for text in list(rec.specifications.values()) + rec.key_features:
+            if _is_hallucinated(text, raw_lower):
+                hallucinated += 1
+                flagged.add(sku)
+
+    return {
+        "field_accuracy": correct / total if total else 0.0,
+        "hallucinated_specs": hallucinated,
+        "flagged_skus": sorted(flagged),
+    }
 
 
 def log_eval_result(record: dict) -> None:
@@ -583,7 +884,49 @@ def log_eval_result(record: dict) -> None:
     - EVAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     - Open EVAL_LOG_PATH in append mode and write json.dumps(record) + "\\n"
     """
-    raise NotImplementedError("Phase 6 ▸ implement log_eval_result()")
+    entry = {**record, "timestamp": datetime.datetime.utcnow().isoformat()}
+    EVAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with EVAL_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def _final_answer_text(messages: list[dict]) -> str:
+    """Pull the assistant's final text answer out of a finished agentic-loop history."""
+    for msg in reversed(messages):
+        if msg["role"] != "assistant":
+            continue
+        texts = [b.text for b in msg["content"] if getattr(b, "type", None) == "text"]
+        if texts:
+            return " ".join(t.strip() for t in texts).strip()
+    return ""
+
+
+def _answer_query(
+    client: anthropic.Anthropic,
+    query: str,
+    context: str,
+    tools: list[dict],
+) -> str:
+    """Drive one grounded Q&A turn through the agentic loop and return the answer.
+
+    When context is present it is passed as a citations-enabled document block so the
+    answer can cite the retrieved source; the loop can still call tools for any spec
+    that is missing from the context.
+    """
+    if context:
+        user_content = [
+            {
+                "type": "document",
+                "source": {"type": "text", "media_type": "text/plain", "data": context},
+                "title": "Product Context",
+                "citations": {"enabled": True},
+            },
+            {"type": "text", "text": query},
+        ]
+    else:
+        user_content = query
+    messages = run_qa_agentic_loop(client, [{"role": "user", "content": user_content}], tools)
+    return _final_answer_text(messages)
 
 
 def run_evaluation(
@@ -613,7 +956,53 @@ def run_evaluation(
 
     - Print an overall PASS/FAIL summary (choose and document your own thresholds)
     """
-    raise NotImplementedError("Phase 6 ▸ implement run_evaluation()")
+    # ── ENRICHMENT ACCURACY ───────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("ENRICHMENT ACCURACY (5 golden products)")
+    print("=" * 60)
+    enrichment = evaluate_enrichment_accuracy(records)
+    log_eval_result({"track": "enrichment", **enrichment})
+    print(f"  Field accuracy    : {enrichment['field_accuracy']:.0%}")
+    print(f"  Hallucinated specs: {enrichment['hallucinated_specs']}")
+    print(f"  Flagged SKUs      : {', '.join(enrichment['flagged_skus']) or 'none'}")
+
+    # ── Q&A FAITHFULNESS ──────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Q&A FAITHFULNESS (5 golden queries)")
+    print("=" * 60)
+    scores: list[int] = []
+    for entry in QA_GOLDEN_SET:
+        query = entry["query"]
+        context = ""
+        if collection is not None:
+            context = retrieve_product_context(query, collection, category_filter=None)
+        answer = _answer_query(client, query, context, tools)
+        faith = judge_faithfulness(client, context, answer)
+        scores.append(faith["score"])
+        log_eval_result({
+            "track": "qa",
+            "query": query,
+            "expected_source": entry["expected_source"],
+            "answer": answer,
+            **faith,
+        })
+        print(f"\n  Q: {query}")
+        print(f"  A: {answer}")
+        print(f"  Faithfulness: {faith['score']}/5 — {faith['reasoning']}")
+
+    avg_faith = sum(scores) / len(scores) if scores else 0.0
+    print(f"\n  Average faithfulness: {avg_faith:.1f} / 5")
+
+    # ── OVERALL PASS/FAIL (thresholds chosen for this case study) ─────────────
+    enrichment_pass = enrichment["field_accuracy"] >= 0.80 and enrichment["hallucinated_specs"] == 0
+    qa_pass = avg_faith >= 4.0
+    print("\n" + "=" * 60)
+    print(f"  ENRICHMENT : {'PASS' if enrichment_pass else 'FAIL'}  "
+          f"(threshold: field accuracy >= 80% and 0 hallucinated specs)")
+    print(f"  Q&A        : {'PASS' if qa_pass else 'FAIL'}  "
+          f"(threshold: avg faithfulness >= 4.0 / 5)")
+    print(f"  OVERALL    : {'PASS' if enrichment_pass and qa_pass else 'FAIL'}")
+    print("=" * 60)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -630,26 +1019,49 @@ def main() -> None:
     print(f"\n  Enrichment summary: {summary}")
 
     # ── Phase 5: Build the RAG index ──────────────────────────────────────────
-    # Comment this block out until Phase 5 is implemented:
-    # collection = build_product_index(records)
+    # Degrades gracefully: if VOYAGE_API_KEY / chromadb aren't configured, the rest
+    # of the run (enrichment + conversation) still works — retrieval is just skipped.
     collection = None
-    product_context = ""
+    try:
+        collection = build_product_index(records)
+    except Exception as e:  # noqa: BLE001 — keep Phases 1-4 runnable without RAG deps
+        print(f"\n  [RAG index unavailable — continuing without retrieval] {e}")
 
     # ── Run the test Q&A conversation end-to-end ──────────────────────────────
     print(f"\n{'='*60}")
     print("Running: Dell XPS 15 multi-turn Q&A test conversation")
     print("=" * 60)
 
-    manager = ProductConversationManager(client, QA_SYSTEM.format(product_context=product_context))
+    # Drive the conversation through the Phase 4 agentic loop so the assistant can
+    # ground answers in retrieved context (Phase 5) AND call the live tools (Phase 4).
+    # The bare ProductConversationManager path always returns the fallback here: it
+    # is built with an empty product_context and passes no tools, so the grounding
+    # rule leaves it nothing to answer from. We thread `messages` across turns to
+    # keep the multi-turn history, injecting each turn's retrieved context as a
+    # citations-enabled document block.
+    messages: list[dict] = []
     for turn in TEST_CONVERSATION:
+        context = ""
         if collection is not None:
-            product_context = retrieve_product_context(turn, collection, category_filter="electronics")
-        reply = manager.send(turn, skus_mentioned=("SKU-E001",))
-        print(f"\n  Customer: {turn}\n  Assistant: {reply}")
+            context = retrieve_product_context(turn, collection, category_filter="electronics")
+        if context:
+            user_content: Any = [
+                {
+                    "type": "document",
+                    "source": {"type": "text", "media_type": "text/plain", "data": context},
+                    "title": "Product Context",
+                    "citations": {"enabled": True},
+                },
+                {"type": "text", "text": turn},
+            ]
+        else:
+            user_content = turn  # no RAG context — the tools still cover specs/stock/price
+        messages.append({"role": "user", "content": user_content})
+        messages = run_qa_agentic_loop(client, messages, tools)
+        print(f"\n  Customer: {turn}\n  Assistant: {_final_answer_text(messages)}")
 
     # ── Phase 6: Run full evaluation ──────────────────────────────────────────
-    # Uncomment when Phase 6 is ready:
-    # run_evaluation(client, records, collection, tools)
+    run_evaluation(client, records, collection, tools)
 
 
 if __name__ == "__main__":
