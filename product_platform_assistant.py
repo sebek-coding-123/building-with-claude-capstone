@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, PositiveFloat, ValidationError, field_validator
 
 import anthropic
 
@@ -235,19 +235,23 @@ class ProductRecord(BaseModel):
     - Remember: in Pydantic v2, @classmethod must appear ABOVE @field_validator
     """
 
-    sku:               Any   # str
-    name:               Any   # str
-    brand:              Any   # Optional[str]
-    category:           Any   # Literal["electronics","apparel","homeware","beauty","grocery","sports","other"]
-    subcategory:        Any   # str
-    price_inr:          Any   # float — must be > 0
-    mrp_inr:            Any   # Optional[float] — original price if discounted
-    key_features:       Any   # list[str] — 3-6 bullet points
-    specifications:     Any   # dict[str, str] — e.g. {"RAM": "16GB"}
-    in_stock:           Any   # bool
-    warranty_months:    Any   # Optional[int]
-    care_instructions:  Any   # Optional[str] — relevant for apparel/homeware
+    sku:               str   # str
+    name:               str   # str
+    brand:              Optional[str]   # Optional[str]
+    category:           Literal["electronics","apparel","homeware","beauty","grocery","sports","other"]   # Literal["electronics","apparel","homeware","beauty","grocery","sports","other"]
+    subcategory:        str   # str
+    price_inr:          float   # float — must be > 0
+    mrp_inr:            Optional[float]   # Optional[float] — original price if discounted
+    key_features:       list[str]   # list[str] — 3-6 bullet points
+    specifications:     dict[str,str]   # dict[str, str] — e.g. {"RAM": "16GB"}
+    in_stock:           bool   # bool
+    warranty_months:    Optional[int]   # Optional[int]
+    care_instructions:  Optional[str]   # Optional[str] — relevant for apparel/homeware
 
+    @field_validator("price_inr")
+    def validate_price_inr(cls,value):
+        if value <= 0:
+            raise ValueError("price_inr must be positive")
     # TODO: add @field_validator("price_inr") that raises ValueError if value <= 0
 
 
@@ -269,6 +273,8 @@ def extract_product_record(
     - On ValidationError: append the assistant response and error details, then retry
     - After MAX_PARSE_RETRIES attempts, re-raise the last ValidationError
     """
+    messages = [{"role":"user","content":f"sku: {sku} {raw_description} extract all ProductRecord fields"}]
+    client.messages.parse("claude-sonnet-4-6",1500,system=ENRICHMENT_SYSTEM, messages=messages,output_format=ProductRecord)
     raise NotImplementedError("Phase 2 ▸ implement extract_product_record()")
 
 
