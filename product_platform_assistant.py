@@ -318,6 +318,7 @@ def run_enrichment_pipeline(
             if retries > 0:
                 retry_dict[sku]=retries
                 retried +=1
+            print("Enriched SKU " + sku)
         except ValidationError as e:
             print(f"ERROR: {sku} - {e}")
             failed += 1
@@ -568,6 +569,7 @@ def run_qa_agentic_loop(
                 continue
             print(f"  [tool] {block.name}({json.dumps(block.input)})")
             result = TOOL_FN_MAP[block.name](**block.input)
+            print(f"         source -> {json.dumps(result)}")
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -890,15 +892,33 @@ def log_eval_result(record: dict) -> None:
         f.write(json.dumps(entry) + "\n")
 
 
-def _final_answer_text(messages: list[dict]) -> str:
-    """Pull the assistant's final text answer out of a finished agentic-loop history."""
+def _final_answer(messages: list[dict]) -> tuple[str, list[str]]:
+    """Return (answer_text, sources) from a finished agentic-loop history.
+
+    `sources` are the exact cited_text snippets Claude drew on, extracted from the
+    citations attached to its answer (citations were enabled on the retrieved
+    product-context document block). Facts that came from a live tool are surfaced
+    separately by the `[tool] ... source ->` lines printed during the loop.
+    """
     for msg in reversed(messages):
         if msg["role"] != "assistant":
             continue
-        texts = [b.text for b in msg["content"] if getattr(b, "type", None) == "text"]
+        texts: list[str] = []
+        sources: list[str] = []
+        for block in msg["content"]:
+            if getattr(block, "type", None) != "text":
+                continue
+            texts.append(block.text)
+            for citation in (getattr(block, "citations", None) or []):
+                cited = (getattr(citation, "cited_text", "") or "").strip()
+                if not cited:
+                    continue
+                snippet = cited if len(cited) <= 200 else cited[:200] + "…"
+                if snippet not in sources:
+                    sources.append(snippet)
         if texts:
-            return " ".join(t.strip() for t in texts).strip()
-    return ""
+            return " ".join(t.strip() for t in texts).strip(), sources
+    return "", []
 
 
 def _answer_query(
@@ -906,12 +926,12 @@ def _answer_query(
     query: str,
     context: str,
     tools: list[dict],
-) -> str:
+) -> tuple[str, list[str]]:
     """Drive one grounded Q&A turn through the agentic loop and return the answer.
 
     When context is present it is passed as a citations-enabled document block so the
     answer can cite the retrieved source; the loop can still call tools for any spec
-    that is missing from the context.
+    that is missing from the context. Returns (answer_text, cited_sources).
     """
     if context:
         user_content = [
@@ -926,7 +946,7 @@ def _answer_query(
     else:
         user_content = query
     messages = run_qa_agentic_loop(client, [{"role": "user", "content": user_content}], tools)
-    return _final_answer_text(messages)
+    return _final_answer(messages)
 
 
 def run_evaluation(
@@ -976,7 +996,7 @@ def run_evaluation(
         context = ""
         if collection is not None:
             context = retrieve_product_context(query, collection, category_filter=None)
-        answer = _answer_query(client, query, context, tools)
+        answer, sources = _answer_query(client, query, context, tools)
         faith = judge_faithfulness(client, context, answer)
         scores.append(faith["score"])
         log_eval_result({
@@ -984,10 +1004,15 @@ def run_evaluation(
             "query": query,
             "expected_source": entry["expected_source"],
             "answer": answer,
+            "sources": sources,
             **faith,
         })
         print(f"\n  Q: {query}")
         print(f"  A: {answer}")
+        if sources:
+            print("  Sources cited:")
+            for s in sources:
+                print(f"    • {s}")
         print(f"  Faithfulness: {faith['score']}/5 — {faith['reasoning']}")
 
     avg_faith = sum(scores) / len(scores) if scores else 0.0
@@ -1058,7 +1083,12 @@ def main() -> None:
             user_content = turn  # no RAG context — the tools still cover specs/stock/price
         messages.append({"role": "user", "content": user_content})
         messages = run_qa_agentic_loop(client, messages, tools)
-        print(f"\n  Customer: {turn}\n  Assistant: {_final_answer_text(messages)}")
+        answer, sources = _final_answer(messages)
+        print(f"\n  Customer: {turn}\n  Assistant: {answer}")
+        if sources:
+            print("  Sources cited:")
+            for s in sources:
+                print(f"    • {s}")
 
     # ── Phase 6: Run full evaluation ──────────────────────────────────────────
     run_evaluation(client, records, collection, tools)
